@@ -28,9 +28,9 @@
       "excludeList": [],
       "toolchain": "GCC",
       "compileConfig": {
-        "cpuType": "Cortex-M3",
+        "cpuType": "Cortex-M4",
         "archExtensions": "",
-        "floatingPointHardware": "none",
+        "floatingPointHardware": "single",
         "scatterFilePath": "STM32F407XX_FLASH.ld",
         "useCustomScatterFile": true,
         "storageLayout": {
