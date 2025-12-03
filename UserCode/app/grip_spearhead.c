@@ -5,19 +5,49 @@
 #include "tim.h"
 #include "interfaces/chassis_if.h"
 #include "math.h"
+#include "cmsis_os2.h"
+#include "usart.h"
+
+// 全局消息队列：用于传递上位机命令（假设每条命令 ≤ 64 字节）
+osMessageQueueId_t g_cmdQueue = NULL;
+#define CMD_MAX_LEN 64
 
 PWM_t gripServo_PWM;
 PWM_t helpServo_PWM;
-Grip_t gripStruct = {
-    .gripAngle = GRIPANGLE_PUT,
-    .helpState = FREESTATE,
-    .turnoverState = TURNOVER_INIT
-};
+Grip_t gripStruct;
+GripFeedback feedbackDatas;
 
 DJI_t dji;
 Motor_PosCtrl_t pos_dji;
 
-Chassis_t chassis;
+Chassis_t chassis;      ///< 接入整体代码后不再需要写，只是为了不报错加的
+
+/*  第一个字节为“0x00”，表示返回的数据是各种是否情况的状态返回；
+    第一个字节为“0x11”，表示返回的数据是目标端头与夹爪的相对位置；
+    第一个字节为“0x22”，表示返回的数据是R2与武馆出口的相对位置； */
+// 使用轮询方式（简单，适合低速）
+void UartReceiverTask(void *argument) {
+    uint8_t byte;
+    uint8_t buffer[CMD_MAX_LEN];
+    uint8_t idx = 0;
+
+    for (;;) {
+        // 轮询接收一个字节（1ms 超时）
+        if (HAL_UART_Receive(&huart1, &byte, 1, 1) == HAL_OK) {
+            if (byte == '\n') {
+                // 帧结束
+                if (idx > 0) {
+                    // 将完整命令拷贝到队列（注意：CMSIS 队列拷贝整个对象）
+                    osMessageQueuePut(g_cmdQueue, buffer, 0, 0);
+                    idx = 0;
+                }
+            } else if (idx < CMD_MAX_LEN - 1) {
+                buffer[idx++] = byte;
+            }
+        }
+        osDelay(1); // 避免忙等
+    }
+}
 
 void Servo_Init()
 {
@@ -75,6 +105,9 @@ void DJI_Control_Init()
 
 void grip_init()
 {
+    gripStruct.gripAngle = GRIPANGLE_PUT;
+    gripStruct.helpState = FREESTATE;
+    gripStruct.turnoverState = TURNOVER_INIT;
     Servo_Init();
     DJI_Control_Init();
 }
@@ -119,146 +152,153 @@ int gripSpearTurn(Grip_t *gripStruct, Motor_PosCtrl_t *hposCtrl, float turnAngle
     return 0;
 }
 
+void movePosition(float postureX, float postureY)
+{
+    Chassis_SetTargetPostureInBody(&chassis,&(Chassis_PostureTarget_t) { 
+        .posture = {
+            .x   = postureX,
+            .y   = postureY,
+            .yaw = 0.0f,
+        },
+        .speed  = 0.25f,
+        .omega  = 30.0f,
+    });
+}
+
+void moveTurn(float postureYaw)
+{
+    Chassis_SetTargetPostureInBody(&chassis,&(Chassis_PostureTarget_t) { 
+        .posture = {
+            .x   = 0.0f,
+            .y   = 0.0f,
+            .yaw = postureYaw,
+        },
+        .speed  = 0.25f,
+        .omega  = 30.0f,
+    });
+}
+
 /* 夹取端头的任务函数 */
 void vGripSpearheadTask(void *pvParameters)
 {
+    uint8_t cmdBuffer[CMD_MAX_LEN];
+    uint8_t headGrippedNum = 0;
+    uint8_t response[3] = {0xA0,0x00,0xB0};
     grip_init();
-    float relativePositionCar[2] = {0};     //< 某一物体相对R2的二维坐标
-    float relativePositionHead[3] = {0};    //< 目标端头的相对位置数据
-    uint8_t spearheadFlag = 1;          //< 要夹取的端头标志，0已夹取，1-6优先级依次递减的端头(掌左->掌右->拳左->拳右->矛尖左->矛尖右)
-    uint8_t findShelfFlag = 0;          //< 是否寻找到架子的标志位
     for ( ;; )
     {
-        /* 1. 移动转圈寻找摆端头的架子，并移动到其附近 */ //< 逆时针转圈寻找
-        do{ //< 转圈寻找
-            Chassis_SetTargetPostureInBody(&chassis,&(Chassis_PostureTarget_t) { 
-                .posture = {
-                    .x   = 0.0f,
-                    .y   = 0.0f,
-                    .yaw = 90.0f,
-                },
-                .speed  = 0.25f,
-                .omega  = 30.0f,
-            });
-            osDelay(500);  //< 留给视觉一定的识别时间
-            /* findShelfFlag = isFindShelf() */ //< 上位机传来是否找到架子
-        } while (findShelfFlag == 0);
-
-        do{ //< 移动
-            /* relativePositionCar[2] = getRelativeShelfPos() */ //< 获取架子与R2的相对位置信息 relativePositionCar[2], [0]前后相对位置，[1]左右相对位置
-            Chassis_SetTargetPostureInBody(&chassis,&(Chassis_PostureTarget_t) {    
-                .posture = {
-                    .x   = relativePositionCar[1],
-                    .y   = relativePositionCar[0],
-                    .yaw = 0.0f,
-                },
-                .speed  = 0.25f,
-                .omega  = 30.0f,
-            });
-            osDelay(200);
-        } while ( (fabs(relativePositionCar[0]) < POS_ERRORMAX) && (fabs(relativePositionCar[1]) < POS_ERRORMAX) );
+        /* 1. 移动到摆端头的架子附近 */ //< 【初步移动到架子前】
+        movePosition(SHELF_POSITION_X, SHELF_POSITION_Y);
+        osDelay(1000);      //< 给移动留一定时间
+        /* upGripper(GRIP_HEIGHT)*/ //< 根据相对位置夹爪上下移动【要与越障升降共用函数】【待定】
 
         /* 2. 明确要夹取的端头，并夹取 */
-        while (spearheadFlag != 0)
+        while (headGrippedNum < NEEDHEADNUM)
         {
-            /* findSpearhead( spearheadFlag ) */ //< 锁定要夹取的端头函数，【问题：是纯视觉锁定还是先底盘移动到目标一定范围内再视觉精准定位】
-            
-            if ( 0 /* isSpearheadEmple(spearheadFlag) */)   //< 判断目标端头位置是否为空，挂起等待视觉传来信息
+            response[1] = 0x10 + feedbackDatas.spearheadFlag;
+            HAL_UART_Transmit(&huart1, (uint8_t*)response, 1, HAL_MAX_DELAY);       //< 传给上位机消息，要求去返回目标端头的状态或位置信息
+            do{
+                //< 视觉锁定目标端头，并传来数据
+                if (osMessageQueueGet(g_cmdQueue, cmdBuffer, NULL, osWaitForever) == osOK) {
+                    if (cmdBuffer[0] == 0x00){                              //< 抢同一端头或目标端头已被拿走的情况
+                        if (cmdBuffer[1] == 0x00 || cmdBuffer[1] == 0xff){
+                            feedbackDatas.spearheadFlag++;
+                            if (feedbackDatas.spearheadFlag > 6) {
+                                break;
+                            }
+                        }
+                    }
+                    else if (cmdBuffer[0] == 0x11){                         //< 无特殊情况，传回夹爪与目标端头的相对位置
+                        feedbackDatas.postureX = cmdBuffer[1];
+                        feedbackDatas.postureY = cmdBuffer[2];
+                        movePosition(feedbackDatas.postureX, feedbackDatas.postureY);
+                    }
+                }
+            } while ( (cmdBuffer[0] == 0x00) || ((feedbackDatas.postureX > MAXERROR) && (feedbackDatas.postureY > MAXERROR)));
+            /* 夹取目标端头 */
+            gripSpearhead(&gripStruct, &gripServo_PWM, GRIPANGLE_GRIP);
+
+            /* 3. 辅助机构辅助 */
+            if ((feedbackDatas.spearheadFlag + 1) / 2 == 1)
             {
-                spearheadFlag++;
+                gripSpearHelp(&gripStruct, &helpServo_PWM, PLAMSTATE);
             }
-            else if ( 0 /* isOpponentGripSame(spearheadFlag) */) //< 判断对方是否夹取同一端头，挂起等待视觉传来信息
+            else if ((feedbackDatas.spearheadFlag + 1) / 2 == 2)
             {
-                spearheadFlag++; //< 放弃当前端头，夹取下一个优先级的端头
+                gripSpearHelp(&gripStruct, &helpServo_PWM, FISTSTATE);
+            }
+            else if ((feedbackDatas.spearheadFlag + 1) / 2 == 3)
+            {
+                gripSpearHelp(&gripStruct, &helpServo_PWM, SPEARSTATE);
             }
             else
             {
-                /* 根据视觉获得的相对位置移动夹爪 */ //< 【夹爪上升高度应该可以写死】
-                do{
-                    //< 【如何获取上位机传来的信息】
-                    /* relativePositionHead[3] = getRelativeHeadPos() */ //< 获取当前夹爪与目标端头的相对位置信息 relativePosition[3], [0]前后相对位置(目标端头相对夹爪靠前为正)，[1]左右相对位置(目标端头相对夹爪偏右为正)，[2]上下相对位置(目标端头相对夹爪偏上为正)
-                    Chassis_SetTargetPostureInBody(&chassis,&(Chassis_PostureTarget_t) {    //< 根据相对位置移动底盘
-                        .posture = {
-                        .x   = relativePositionHead[1],
-                        .y   = relativePositionHead[0],
-                        .yaw = 0.0f,
-                        },
-                        .speed  = 0.25f,
-                        .omega  = 30.0f,
-                    });
-                    /* upGripper(relativePosition[2])*/ //< 根据相对位置夹爪上下移动【要与越障升降共用函数】【待定】
-                } while ( (relativePositionHead[0] < MAXERROR) && (relativePositionHead[1] < MAXERROR) && (relativePositionHead[2] < MAXERROR));
-                /* 夹取目标端头 */
-                gripSpearhead(&gripStruct, &gripServo_PWM, GRIPANGLE_GRIP);
-                spearheadFlag = 0;
+                /* 所有端头已被拿走 */
             }
-            if (spearheadFlag > 6) 
-            {
-                break;
-            }
-        }
 
-        /* 3. 辅助机构辅助 */
-        if ((spearheadFlag + 1) / 2 == 1)
-        {
-            gripSpearHelp(&gripStruct, &helpServo_PWM, PLAMSTATE);
-        }
-        else if ((spearheadFlag + 1) / 2 == 2)
-        {
-            gripSpearHelp(&gripStruct, &helpServo_PWM, FISTSTATE);
-        }
-        else if ((spearheadFlag + 1) / 2 == 3)
-        {
-            gripSpearHelp(&gripStruct, &helpServo_PWM, SPEARSTATE);
-        }
-        else
-        {
-            /* 所有端头已被拿走 */
-        }
-
-        /* 4. 翻转夹爪 */
-        gripSpearTurn(&gripStruct, &pos_dji, TURNOVER_MATCH);
+            /* 4. 翻转夹爪 */
+            gripSpearTurn(&gripStruct, &pos_dji, TURNOVER_MATCH);
+            /* upGripper(0)*/ //< 夹爪下降回最低处【要与越障升降共用函数】【待定】
         
-        /* 5. 转身 */
-        Chassis_SetTargetPostureInBody(&chassis,&(Chassis_PostureTarget_t) {    //< 具体数值待定
-            .posture = {
-                .x   = 0.0f,
-                .y   = 0.0f,
-                .yaw = 180.0f,
-            },
-            .speed  = 0.25f,
-            .omega  = 30.0f,
-        });
+            /* 5. 转身 */
+            moveTurn(180.0);    //< 【具体数值待定】
 
-        /* 6. 等待R1完成武器对接 */
-        /* isFinishDock() */ //< 挂起等待视觉判断R1完成武器对接的信息传来
+            /* 6. 等待R1完成武器对接 */
+            do{
+                response[1] = 0xAA;
+                HAL_UART_Transmit(&huart1, (uint8_t*)response, 1, HAL_MAX_DELAY);           //< 传给上位机消息，要求去判断端头是否对接完成
+                if (osMessageQueueGet(g_cmdQueue, cmdBuffer, NULL, osWaitForever) == osOK){
+                    if (cmdBuffer[0] == 0x00){
+                        if (cmdBuffer[1] == 0x11){
+                            feedbackDatas.isFinishDockFlag = 1;
+                        }
+                        else {
+                            feedbackDatas.isFinishDockFlag = 0;
+                        }
+                    }
+                }
+                osDelay(100);
+            } while (feedbackDatas.isFinishDockFlag == 0);
+            
+            /* 完成了一个端头的夹取和对接 */
+            headGrippedNum++;
+            if (headGrippedNum > 1){
+                moveTurn(180.0);        ///< 转身继续夹取
+            }
+        }
 
         /* 7. 判断R1已离开武馆区 */ //< 【这里也可以选择跟随R1离开武馆区】
-        /* isLeave_R1() */ //< 挂起等待视觉判断R1已离开的信息传来
+        do{
+            //< 视觉判断R1是否已离开武馆区
+            response[1] = 0xBB;
+            HAL_UART_Transmit(&huart1, (uint8_t*)response, 1, HAL_MAX_DELAY);       //< 传给上位机消息，要求去判断R1是否已离开武馆区
+            if (osMessageQueueGet(g_cmdQueue, cmdBuffer, NULL, osWaitForever) == osOK){
+                if (cmdBuffer[0] == 0x00){
+                    if (cmdBuffer[1] == 0x22){
+                        feedbackDatas.isR1LeaveFlag = 1;
+                    }
+                    else {
+                        feedbackDatas.isR1LeaveFlag = 0;
+                    }
+                }
+            }
+            osDelay(100);
+        } while (feedbackDatas.isR1LeaveFlag == 0);
 
         /* 8. 离开武馆区 */
         do{ //< 移动
-            /* relativePositionCar[2] = getRelativeExitPos() */ //< 获取出口与R2的相对位置信息 relativePositionCar[2], [0]前后相对位置，[1]左右相对位置
-            Chassis_SetTargetPostureInBody(&chassis,&(Chassis_PostureTarget_t) {    
-                .posture = {
-                    .x   = relativePositionCar[1],
-                    .y   = relativePositionCar[0],
-                    .yaw = 0.0f,
-                },
-                .speed  = 0.25f,
-                .omega  = 30.0f,
-            });
-            osDelay(200);
-        } while ( (fabs(relativePositionCar[0]) < POS_ERRORMAX) && (fabs(relativePositionCar[1]) < POS_ERRORMAX) );
+            response[1] = 0xCC;
+            HAL_UART_Transmit(&huart1, (uint8_t*)response, 1, HAL_MAX_DELAY);       //< 传给上位机消息，要求返回武馆区出口的位置信息
+            if (osMessageQueueGet(g_cmdQueue, cmdBuffer, NULL, osWaitForever) == osOK){
+                if (cmdBuffer[0] == 0x22){
+                    feedbackDatas.postureX = cmdBuffer[1];
+                    feedbackDatas.postureY = cmdBuffer[2];
+                }
+            }
+            movePosition(feedbackDatas.postureX, feedbackDatas.postureY);
+            osDelay(100);
+        } while ( (fabs(feedbackDatas.postureX) < POS_ERRORMAX) && (fabs(feedbackDatas.postureX) < POS_ERRORMAX) );
         //< 转身离开
-        Chassis_SetTargetPostureInBody(&chassis,&(Chassis_PostureTarget_t) {    
-            .posture = {
-                .x   = 0.0f,
-                .y   = 0.0f,
-                .yaw = 90.0f,
-            },
-            .speed  = 0.25f,
-            .omega  = 30.0f,
-        });
+        moveTurn(90.0);     //< 【具体数值待定】
     }
 }
